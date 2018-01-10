@@ -19,6 +19,7 @@ import re
 
 from . import generic
 from sickbeard import logger, tvcache
+from sickbeard.helpers import tryInt
 from sickbeard.exceptions import ex
 from sickbeard.rssfeeds import RSSFeeds
 from lib.bencode import bdecode
@@ -27,33 +28,31 @@ from lib.bencode import bdecode
 class TorrentRssProvider(generic.TorrentProvider):
 
     def __init__(self, name, url, cookies='', search_mode='eponly', search_fallback=False,
-                 enable_recentsearch=False, enable_backlog=False):
-        generic.TorrentProvider.__init__(self, name)
+                 enable_recentsearch=False, enable_backlog=False, enable_scheduled_backlog=False):
+        self.enable_backlog = bool(tryInt(enable_backlog))
+        self.enable_scheduled_backlog = bool(tryInt(enable_scheduled_backlog))
+        generic.TorrentProvider.__init__(self, name, supports_backlog=self.enable_backlog, cache_update_freq=15)
 
         self.url = url.rstrip('/')
+        self.url_base = self.url
         self.cookies = cookies
 
-        self.enable_recentsearch = enable_recentsearch
-        self.enable_backlog = enable_backlog
+        self.enable_recentsearch = bool(tryInt(enable_recentsearch)) or not self.enable_backlog
         self.search_mode = search_mode
-        self.search_fallback = search_fallback
+        self.search_fallback = bool(tryInt(search_fallback))
 
         self.feeder = RSSFeeds(self)
-        self.cache = TorrentRssCache(self)
 
     def image_name(self):
 
         return generic.GenericProvider.image_name(self, 'torrentrss')
 
     def config_str(self):
-        return '%s|%s|%s|%d|%s|%d|%d|%d' % (self.name or '',
-                                            self.url or '',
-                                            self.cookies or '',
-                                            self.enabled,
-                                            self.search_mode or '',
-                                            self.search_fallback,
-                                            self.enable_recentsearch,
-                                            self.enable_backlog)
+
+        return '%s|%s|%s|%d|%s|%d|%d|%d|%d' % (
+            self.name or '', self.url or '', self.cookies or '', self.enabled,
+            self.search_mode or '', self.search_fallback, self.enable_recentsearch, self.enable_backlog,
+            self.enable_scheduled_backlog)
 
     def _title_and_url(self, item):
 
@@ -63,15 +62,13 @@ class TorrentRssProvider(generic.TorrentProvider):
             title = re.sub(r'\s+', '.', u'' + item.title)
 
         attempt_list = [lambda: item.torrent_magneturi,
-
                         lambda: item.enclosures[0].href,
-
                         lambda: item.link]
 
         for cur_attempt in attempt_list:
             try:
                 url = cur_attempt()
-            except:
+            except (StandardError, Exception):
                 continue
 
             if title and url:
@@ -86,21 +83,29 @@ class TorrentRssProvider(generic.TorrentProvider):
             return success, err_msg
 
         try:
-            items = self.cache_data()
+            items = self._search_provider({'Validate': ['']})
 
             for item in items:
                 title, url = self._title_and_url(item)
                 if not (title and url):
                     continue
                 if url.startswith('magnet:'):
-                    if re.search('urn:btih:([0-9a-f]{32,40})', url):
+                    btih = None
+                    try:
+                        btih = re.findall('urn:btih:([\w]{32,40})', url)[0]
+                        if 32 == len(btih):
+                            from base64 import b16encode, b32decode
+                            btih = b16encode(b32decode(btih))
+                    except (StandardError, Exception):
+                        pass
+                    if re.search('(?i)[0-9a-f]{32,40}', btih):
                         break
                 else:
                     torrent_file = self.get_url(url)
                     try:
                         bdecode(torrent_file)
                         break
-                    except Exception:
+                    except (StandardError, Exception):
                         pass
             else:
                 return False, '%s fetched RSS feed data: %s' % \
@@ -111,22 +116,14 @@ class TorrentRssProvider(generic.TorrentProvider):
         except Exception as e:
             return False, 'Error when trying to load RSS: ' + ex(e)
 
-    def cache_data(self):
+    def _search_provider(self, search_params, **kwargs):
 
-        logger.log(u'TorrentRssCache cache update URL: ' + self.url, logger.DEBUG)
+        result = []
+        for mode in search_params.keys():
+            data = self.feeder.get_feed(self.url)
 
-        data = self.feeder.get_feed(self.url)
+            result += (data and 'entries' in data) and data.entries or []
 
-        return [] if not (data and 'entries' in data) else data.entries
+            self.log_result(mode, count=len(result), url=self.url)
 
-
-class TorrentRssCache(tvcache.TVCache):
-
-    def __init__(self, provider):
-        tvcache.TVCache.__init__(self, provider)
-
-        self.update_freq = 15
-
-    def _cache_data(self):
-
-        return self.provider.cache_data()
+        return result

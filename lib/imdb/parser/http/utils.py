@@ -404,6 +404,15 @@ def build_movie(txt, movieID=None, roleID=None, status=None,
     m = Movie(title=title, movieID=movieID, notes=notes, currentRole=role,
                 roleID=roleID, roleIsPerson=_parsingCharacter,
                 modFunct=modFunct, accessSystem=accessSystem)
+    if additionalNotes:
+        if '(TV Series)' in additionalNotes:
+            m['kind'] = u'tv series'
+        elif '(Video Game)' in additionalNotes:
+            m['kind'] = u'video game'
+        elif '(TV Movie)' in additionalNotes:
+            m['kind'] = u'tv movie'
+        elif '(TV Short)' in additionalNotes:
+            m['kind'] = u'tv short'
     if roleNotes and len(roleNotes) == len(roleID):
         for idx, role in enumerate(m.currentRole):
             try:
@@ -441,12 +450,6 @@ class DOMParserBase(object):
         self._useModule = useModule
         nrMods = len(useModule)
         _gotError = False
-
-        # Force warnings.warn() to omit the source code line in the message
-        formatwarning_orig = warnings.formatwarning
-        warnings.formatwarning = lambda message, category, filename, lineno, line=None: \
-            formatwarning_orig(message, category, filename, lineno, line='')
-
         for idx, mod in enumerate(useModule):
             mod = mod.strip().lower()
             try:

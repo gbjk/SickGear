@@ -47,6 +47,29 @@ def dbFilename(filename='sickbeard.db', suffix=None):
     return ek.ek(os.path.join, sickbeard.DATA_DIR, filename)
 
 
+def mass_upsert_sql(tableName, valueDict, keyDict):
+
+    """
+    use with cl.extend(mass_upsert_sql(tableName, valueDict, keyDict))
+
+    :param tableName: table name
+    :param valueDict: dict of values to be set {'table_fieldname': value}
+    :param keyDict: dict of restrains for update {'table_fieldname': value}
+    :return: list of 2 sql command
+    """
+    cl = []
+
+    genParams = lambda myDict: [x + ' = ?' for x in myDict.keys()]
+
+    cl.append(['UPDATE [%s] SET %s WHERE %s' % (
+        tableName, ', '.join(genParams(valueDict)), ' AND '.join(genParams(keyDict))), valueDict.values() + keyDict.values()])
+
+
+    cl.append(['INSERT INTO [' + tableName + '] (' + ', '.join(["'%s'" % ('%s' % v).replace("'", "''") for v in valueDict.keys() + keyDict.keys()]) + ')' +
+                ' SELECT ' + ', '.join(["'%s'" % ('%s' % v).replace("'", "''") for v in valueDict.values() + keyDict.values()]) + ' WHERE changes() = 0'])
+    return cl
+
+
 class DBConnection(object):
     def __init__(self, filename='sickbeard.db', suffix=None, row_type=None):
 
@@ -66,11 +89,16 @@ class DBConnection(object):
 
     def checkDBVersion(self):
 
-        result = None
-
         try:
             if self.hasTable('db_version'):
                 result = self.select('SELECT db_version FROM db_version')
+            else:
+                version = self.select('PRAGMA user_version')[0]['user_version']
+                if version:
+                    self.action('PRAGMA user_version = 0')
+                    self.action('CREATE TABLE db_version (db_version INTEGER);')
+                    self.action('INSERT INTO db_version (db_version) VALUES (%s);' % version)
+                return version
         except:
             return 0
 
@@ -95,17 +123,23 @@ class DBConnection(object):
 
             while attempt < 5:
                 try:
+                    affected = 0
                     for qu in querylist:
+                        cursor = self.connection.cursor()
                         if len(qu) == 1:
                             if logTransaction:
                                 logger.log(qu[0], logger.DB)
-                            sqlResult.append(self.connection.execute(qu[0]).fetchall())
+
+                            sqlResult.append(cursor.execute(qu[0]).fetchall())
                         elif len(qu) > 1:
                             if logTransaction:
                                 logger.log(qu[0] + ' with args ' + str(qu[1]), logger.DB)
-                            sqlResult.append(self.connection.execute(qu[0], qu[1]).fetchall())
+                            sqlResult.append(cursor.execute(qu[0], qu[1]).fetchall())
+                        affected += cursor.rowcount
                     self.connection.commit()
-                    logger.log(u'Transaction with ' + str(len(querylist)) + u' queries executed', logger.DEBUG)
+                    if affected > 0:
+                        logger.log(u'Transaction with %s queries executed affected %i row%s' % (
+                            len(querylist), affected, helpers.maybe_plural(affected)), logger.DEBUG)
                     return sqlResult
                 except sqlite3.OperationalError as e:
                     sqlResult = []
@@ -219,6 +253,20 @@ class DBConnection(object):
     def addColumn(self, table, column, type='NUMERIC', default=0):
         self.action('ALTER TABLE [%s] ADD %s %s' % (table, column, type))
         self.action('UPDATE [%s] SET %s = ?' % (table, column), (default,))
+
+    def has_flag(self, flag_name):
+        sql_result = self.select('SELECT flag FROM flags WHERE flag = ?', [flag_name])
+        if 0 < len(sql_result):
+            return True
+        return False
+
+    def add_flag(self, flag_name):
+        if not self.has_flag(flag_name):
+            self.action('INSERT INTO flags (flag) VALUES (?)', [flag_name])
+
+    def remove_flag(self, flag_name):
+        if self.has_flag(flag_name):
+            self.action('DELETE FROM flags WHERE flag = ?', [flag_name])
 
     def close(self):
         """Close database connection"""
@@ -423,8 +471,8 @@ def MigrationCode(myDB):
         40: sickbeard.mainDB.BumpDatabaseVersion,
         41: sickbeard.mainDB.Migrate41,
         42: sickbeard.mainDB.Migrate41,
-        43: sickbeard.mainDB.Migrate41,
-        44: sickbeard.mainDB.Migrate41,
+        43: sickbeard.mainDB.Migrate43,
+        44: sickbeard.mainDB.Migrate43,
 
         4301: sickbeard.mainDB.Migrate4301,
         4302: sickbeard.mainDB.Migrate4302,
@@ -442,6 +490,9 @@ def MigrationCode(myDB):
         20000: sickbeard.mainDB.DBIncreaseTo20001,
         20001: sickbeard.mainDB.AddTvShowOverview,
         20002: sickbeard.mainDB.AddTvShowTags,
+        20003: sickbeard.mainDB.ChangeMapIndexer,
+        20004: sickbeard.mainDB.AddShowNotFoundCounter,
+        20005: sickbeard.mainDB.AddFlagTable
         # 20002: sickbeard.mainDB.AddCoolSickGearFeature3,
     }
 
@@ -472,9 +523,45 @@ def MigrationCode(myDB):
                 else:
                     logger.log_error_and_exit(u'Failed to restore database version: %s' % db_version)
 
+
 def backup_database(filename, version):
     logger.log(u'Backing up database before upgrade')
     if not sickbeard.helpers.backupVersionedFile(dbFilename(filename), version):
         logger.log_error_and_exit(u'Database backup failed, abort upgrading database')
     else:
         logger.log(u'Proceeding with upgrade')
+
+
+def get_rollback_module():
+    import imp
+
+    module_urls = [
+        'https://raw.githubusercontent.com/SickGear/sickgear.extdata/master/SickGear/Rollback/rollback.py']
+
+    try:
+        hdr = '# SickGear Rollback Module'
+        module = ''
+        fetched = False
+
+        for t in range(1, 4):
+            for url in module_urls:
+                try:
+                    module = helpers.getURL(url)
+                    if module and module.startswith(hdr):
+                        fetched = True
+                        break
+                except (StandardError, Exception):
+                    continue
+            if fetched:
+                break
+            time.sleep(30)
+
+        if fetched:
+            loaded = imp.new_module('DbRollback')
+            exec(module, loaded.__dict__)
+            return loaded
+
+    except (StandardError, Exception):
+        pass
+
+    return None

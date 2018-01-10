@@ -21,6 +21,7 @@ import time
 import threading
 import datetime
 import sickbeard
+import traceback
 
 from collections import defaultdict
 from lib import adba
@@ -29,7 +30,6 @@ from sickbeard import name_cache
 from sickbeard import logger
 from sickbeard import db
 from sickbeard.classes import OrderedDefaultdict
-from sickbeard.indexers.indexer_api import get_xem_supported_indexers
 
 exception_dict = {}
 anidb_exception_dict = {}
@@ -45,7 +45,7 @@ exceptionLock = threading.Lock()
 def shouldRefresh(list):
     max_refresh_age_secs = 86400  # 1 day
 
-    my_db = db.DBConnection('cache.db')
+    my_db = db.DBConnection()
     rows = my_db.select('SELECT last_refreshed FROM scene_exceptions_refresh WHERE list = ?', [list])
     if rows:
         last_refresh = int(rows[0]['last_refreshed'])
@@ -55,7 +55,7 @@ def shouldRefresh(list):
 
 
 def setLastRefresh(list):
-    my_db = db.DBConnection('cache.db')
+    my_db = db.DBConnection()
     my_db.upsert('scene_exceptions_refresh',
                  {'last_refreshed': int(time.mktime(datetime.datetime.today().timetuple()))},
                  {'list': list})
@@ -69,7 +69,7 @@ def get_scene_exceptions(indexer_id, season=-1):
     exceptions_list = []
 
     if indexer_id not in exceptionsCache or season not in exceptionsCache[indexer_id]:
-        my_db = db.DBConnection('cache.db')
+        my_db = db.DBConnection()
         exceptions = my_db.select('SELECT show_name FROM scene_exceptions WHERE indexer_id = ? and season = ?',
                                   [indexer_id, season])
         if exceptions:
@@ -90,7 +90,7 @@ def get_scene_exceptions(indexer_id, season=-1):
 def get_all_scene_exceptions(indexer_id):
     exceptions_dict = OrderedDefaultdict(list)
 
-    my_db = db.DBConnection('cache.db')
+    my_db = db.DBConnection()
     exceptions = my_db.select('SELECT show_name,season FROM scene_exceptions WHERE indexer_id = ? ORDER BY season', [indexer_id])
 
     if exceptions:
@@ -108,7 +108,7 @@ def get_scene_seasons(indexer_id):
     exception_sseason_list = []
 
     if indexer_id not in exceptionsSeasonCache:
-        my_db = db.DBConnection('cache.db')
+        my_db = db.DBConnection()
         sql_results = my_db.select('SELECT DISTINCT(season) as season FROM scene_exceptions WHERE indexer_id = ?',
                                    [indexer_id])
         if sql_results:
@@ -199,7 +199,7 @@ def retrieve_exceptions():
     changed_exceptions = False
 
     # write all the exceptions we got off the net into the database
-    my_db = db.DBConnection('cache.db')
+    my_db = db.DBConnection()
     cl = []
     for cur_indexer_id in exception_dict:
 
@@ -211,7 +211,12 @@ def retrieve_exceptions():
             continue
 
         for cur_exception_dict in exception_dict[cur_indexer_id]:
-            cur_exception, cur_season = cur_exception_dict.items()[0]
+            try:
+                cur_exception, cur_season = cur_exception_dict.items()[0]
+            except Exception:
+                logger.log('scene exception error', logger.ERROR)
+                logger.log(traceback.format_exc(), logger.ERROR)
+                continue
 
             # if this exception isn't already in the DB then add it
             if cur_exception not in existing_exceptions:
@@ -242,7 +247,7 @@ def update_scene_exceptions(indexer_id, scene_exceptions):
     Given a indexer_id, and a list of all show scene exceptions, update the db.
     """
     global exceptionsCache
-    my_db = db.DBConnection('cache.db')
+    my_db = db.DBConnection()
     my_db.action('DELETE FROM scene_exceptions WHERE indexer_id=?', [indexer_id])
 
     # A change has been made to the scene exception list. Let's clear the cache, to make this visible
@@ -290,7 +295,7 @@ def _xem_exceptions_fetcher():
             break
 
     if shouldRefresh(xem_list):
-        for indexer in sickbeard.indexerApi().indexers:
+        for indexer in [i for i in sickbeard.indexerApi().indexers if 'xem_origin' in sickbeard.indexerApi(i).config]:
             logger.log(u'Checking for XEM scene exception updates for %s' % sickbeard.indexerApi(indexer).name)
 
             url = 'http://thexem.de/map/allNames?origin=%s%s&seasonNumbers=1'\
@@ -348,7 +353,13 @@ def _xem_get_ids(indexer_name, xem_origin):
 def get_xem_ids():
     global xem_ids_list
 
-    for indexer in get_xem_supported_indexers().values():
-        xem_ids = _xem_get_ids(indexer['name'], indexer['xem_origin'])
+    for iid, name in sickbeard.indexerApi().xem_supported_indexers.iteritems():
+        xem_ids = _xem_get_ids(name, sickbeard.indexerApi(iid).config['xem_origin'])
         if len(xem_ids):
-            xem_ids_list[indexer['id']] = xem_ids
+            xem_ids_list[iid] = xem_ids
+
+
+def has_abs_episodes(ep_obj=None, name=None):
+    return any((name or ep_obj.show.name or '').lower().startswith(x.lower()) for x in [
+        'The Eighties', 'The Making of the Mob', 'The Night Of', 'Roots 2016', 'Trepalium'
+    ])

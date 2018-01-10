@@ -1,6 +1,7 @@
 """
 The httplib2 algorithms ported for use with requests.
 """
+import logging
 import re
 import calendar
 import time
@@ -11,6 +12,8 @@ from requests.structures import CaseInsensitiveDict
 from .cache import DictCache
 from .serialize import Serializer
 
+
+logger = logging.getLogger(__name__)
 
 URI = re.compile(r"^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?")
 
@@ -27,10 +30,12 @@ def parse_uri(uri):
 class CacheController(object):
     """An interface to see if request should cached or not.
     """
-    def __init__(self, cache=None, cache_etags=True, serializer=None):
+    def __init__(self, cache=None, cache_etags=True, serializer=None,
+                 status_codes=None):
         self.cache = cache or DictCache()
         self.cache_etags = cache_etags
         self.serializer = serializer or Serializer()
+        self.cacheable_status_codes = status_codes or (200, 203, 300, 301)
 
     @classmethod
     def _urlnorm(cls, uri):
@@ -57,27 +62,51 @@ class CacheController(object):
         return cls._urlnorm(uri)
 
     def parse_cache_control(self, headers):
-        """
-        Parse the cache control headers returning a dictionary with values
-        for the different directives.
-        """
+        known_directives = {
+            # https://tools.ietf.org/html/rfc7234#section-5.2
+            'max-age': (int, True,),
+            'max-stale': (int, False,),
+            'min-fresh': (int, True,),
+            'no-cache': (None, False,),
+            'no-store': (None, False,),
+            'no-transform': (None, False,),
+            'only-if-cached' : (None, False,),
+            'must-revalidate': (None, False,),
+            'public': (None, False,),
+            'private': (None, False,),
+            'proxy-revalidate': (None, False,),
+            's-maxage': (int, True,)
+        }
+
+        cc_headers = headers.get('cache-control',
+                                 headers.get('Cache-Control', ''))
+
         retval = {}
 
-        cc_header = 'cache-control'
-        if 'Cache-Control' in headers:
-            cc_header = 'Cache-Control'
+        for cc_directive in cc_headers.split(','):
+            parts = cc_directive.split('=', 1)
+            directive = parts[0].strip()
 
-        if cc_header in headers:
-            parts = headers[cc_header].split(',')
-            parts_with_args = [
-                tuple([x.strip().lower() for x in part.split("=", 1)])
-                for part in parts if -1 != part.find("=")
-            ]
-            parts_wo_args = [
-                (name.strip().lower(), 1)
-                for name in parts if -1 == name.find("=")
-            ]
-            retval = dict(parts_with_args + parts_wo_args)
+            try:
+                typ, required = known_directives[directive]
+            except KeyError:
+                logger.debug('Ignoring unknown cache-control directive: %s',
+                             directive)
+                continue
+
+            if not typ or not required:
+                retval[directive] = None
+            if typ:
+                try:
+                    retval[directive] = typ(parts[1].strip())
+                except IndexError:
+                    if required:
+                        logger.debug('Missing value for cache-control '
+                                     'directive: %s', directive)
+                except ValueError:
+                    logger.debug('Invalid value for cache-control directive '
+                                 '%s, must be %s', directive, typ.__name__)
+
         return retval
 
     def cached_request(self, request):
@@ -86,23 +115,28 @@ class CacheController(object):
         return False.
         """
         cache_url = self.cache_url(request.url)
+        logger.debug('Looking up "%s" in the cache', cache_url)
         cc = self.parse_cache_control(request.headers)
 
-        # non-caching states
-        no_cache = True if 'no-cache' in cc else False
-        if 'max-age' in cc and cc['max-age'] == 0:
-            no_cache = True
-
-        # Bail out if no-cache was set
-        if no_cache:
+        # Bail out if the request insists on fresh data
+        if 'no-cache' in cc:
+            logger.debug('Request header has "no-cache", cache bypassed')
             return False
 
-        # It is in the cache, so lets see if it is going to be
-        # fresh enough
-        resp = self.serializer.loads(request, self.cache.get(cache_url))
+        if 'max-age' in cc and cc['max-age'] == 0:
+            logger.debug('Request header has "max_age" as 0, cache bypassed')
+            return False
 
-        # Check to see if we have a cached object
+        # Request allows serving from the cache, let's see if we find something
+        cache_data = self.cache.get(cache_url)
+        if cache_data is None:
+            logger.debug('No cache entry available')
+            return False
+
+        # Check whether it can be deserialized
+        resp = self.serializer.loads(request, cache_data)
         if not resp:
+            logger.warning('Cache entry deserialization failed, entry ignored')
             return False
 
         # If we have a cached 301, return it immediately. We don't
@@ -114,14 +148,19 @@ class CacheController(object):
         # Client can try to refresh the value by repeating the request
         # with cache busting headers as usual (ie no-cache).
         if resp.status == 301:
+            msg = ('Returning cached "301 Moved Permanently" response '
+                   '(ignoring date and etag information)')
+            logger.debug(msg)
             return resp
 
         headers = CaseInsensitiveDict(resp.headers)
         if not headers or 'date' not in headers:
-            # With date or etag, the cached response can never be used
-            # and should be deleted.
             if 'etag' not in headers:
+                # Without date or etag, the cached response can never be used
+                # and should be deleted.
+                logger.debug('Purging cached response: no date or etag')
                 self.cache.delete(cache_url)
+            logger.debug('Ignoring cached response: no date')
             return False
 
         now = time.time()
@@ -129,6 +168,7 @@ class CacheController(object):
             parsedate_tz(headers['date'])
         )
         current_age = max(0, now - date)
+        logger.debug('Current age based on date: %i', current_age)
 
         # TODO: There is an assumption that the result will be a
         #       urllib3 response object. This may not be best since we
@@ -140,8 +180,10 @@ class CacheController(object):
         freshness_lifetime = 0
 
         # Check the max-age pragma in the cache control header
-        if 'max-age' in resp_cc and resp_cc['max-age'].isdigit():
-            freshness_lifetime = int(resp_cc['max-age'])
+        if 'max-age' in resp_cc:
+            freshness_lifetime = resp_cc['max-age']
+            logger.debug('Freshness lifetime from max-age: %i',
+                         freshness_lifetime)
 
         # If there isn't a max-age, check for an expires header
         elif 'expires' in headers:
@@ -149,30 +191,34 @@ class CacheController(object):
             if expires is not None:
                 expire_time = calendar.timegm(expires) - date
                 freshness_lifetime = max(0, expire_time)
+                logger.debug("Freshness lifetime from expires: %i",
+                             freshness_lifetime)
 
-        # determine if we are setting freshness limit in the req
+        # Determine if we are setting freshness limit in the
+        # request. Note, this overrides what was in the response.
         if 'max-age' in cc:
-            try:
-                freshness_lifetime = int(cc['max-age'])
-            except ValueError:
-                freshness_lifetime = 0
+            freshness_lifetime = cc['max-age']
+            logger.debug('Freshness lifetime from request max-age: %i',
+                         freshness_lifetime)
 
         if 'min-fresh' in cc:
-            try:
-                min_fresh = int(cc['min-fresh'])
-            except ValueError:
-                min_fresh = 0
+            min_fresh = cc['min-fresh']
             # adjust our current age by our min fresh
             current_age += min_fresh
+            logger.debug('Adjusted current age from min-fresh: %i',
+                         current_age)
 
-        # see how fresh we actually are
-        fresh = (freshness_lifetime > current_age)
-
-        if fresh:
+        # Return entry if it is fresh enough
+        if freshness_lifetime > current_age:
+            logger.debug('The response is "fresh", returning cached response')
+            logger.debug('%i > %i', freshness_lifetime, current_age)
             return resp
 
         # we're not fresh. If we don't have an Etag, clear it out
         if 'etag' not in headers:
+            logger.debug(
+                'The cached response is "stale" with no etag, purging'
+            )
             self.cache.delete(cache_url)
 
         # return the original handler
@@ -194,7 +240,8 @@ class CacheController(object):
 
         return new_headers
 
-    def cache_response(self, request, response, body=None):
+    def cache_response(self, request, response, body=None,
+                       status_codes=None):
         """
         Algorithm for caching requests.
 
@@ -202,23 +249,48 @@ class CacheController(object):
         """
         # From httplib2: Don't cache 206's since we aren't going to
         #                handle byte range requests
-        if response.status not in [200, 203, 300, 301]:
+        cacheable_status_codes = status_codes or self.cacheable_status_codes
+        if response.status not in cacheable_status_codes:
+            logger.debug(
+                'Status code %s not in %s',
+                response.status,
+                cacheable_status_codes
+            )
             return
 
         response_headers = CaseInsensitiveDict(response.headers)
+
+        # If we've been given a body, our response has a Content-Length, that
+        # Content-Length is valid then we can check to see if the body we've
+        # been given matches the expected size, and if it doesn't we'll just
+        # skip trying to cache it.
+        if (body is not None and
+                "content-length" in response_headers and
+                response_headers["content-length"].isdigit() and
+                int(response_headers["content-length"]) != len(body)):
+            return
 
         cc_req = self.parse_cache_control(request.headers)
         cc = self.parse_cache_control(response_headers)
 
         cache_url = self.cache_url(request.url)
+        logger.debug('Updating cache with response from "%s"', cache_url)
 
         # Delete it from the cache if we happen to have it stored there
-        no_store = cc.get('no-store') or cc_req.get('no-store')
+        no_store = False
+        if 'no-store' in cc:
+            no_store = True
+            logger.debug('Response header has "no-store"')
+        if 'no-store' in cc_req:
+            no_store = True
+            logger.debug('Request header has "no-store"')
         if no_store and self.cache.get(cache_url):
+            logger.debug('Purging existing cache entry to honor "no-store"')
             self.cache.delete(cache_url)
 
         # If we've been given an etag, then keep the response
         if self.cache_etags and 'etag' in response_headers:
+            logger.debug('Caching due to etag')
             self.cache.set(
                 cache_url,
                 self.serializer.dumps(request, response, body=body),
@@ -227,6 +299,7 @@ class CacheController(object):
         # Add to the cache any 301s. We do this before looking that
         # the Date headers.
         elif response.status == 301:
+            logger.debug('Caching permanant redirect')
             self.cache.set(
                 cache_url,
                 self.serializer.dumps(request, response)
@@ -237,17 +310,18 @@ class CacheController(object):
         # the cache.
         elif 'date' in response_headers:
             # cache when there is a max-age > 0
-            if cc and cc.get('max-age'):
-                if int(cc['max-age']) > 0:
-                    self.cache.set(
-                        cache_url,
-                        self.serializer.dumps(request, response, body=body),
-                    )
+            if 'max-age' in cc and cc['max-age'] > 0:
+                logger.debug('Caching b/c date exists and max-age > 0')
+                self.cache.set(
+                    cache_url,
+                    self.serializer.dumps(request, response, body=body),
+                )
 
             # If the request can expire, it means we should cache it
             # in the meantime.
             elif 'expires' in response_headers:
                 if response_headers['expires']:
+                    logger.debug('Caching b/c of expires header')
                     self.cache.set(
                         cache_url,
                         self.serializer.dumps(request, response, body=body),

@@ -27,10 +27,11 @@ from sickbeard import logger
 from sickbeard.common import Quality
 
 from sickbeard import helpers, show_name_helpers
-from sickbeard.exceptions import AuthException, ex
+from sickbeard.exceptions import MultipleShowObjectsException, AuthException, ex
 from name_parser.parser import NameParser, InvalidNameException, InvalidShowException
 from sickbeard.rssfeeds import RSSFeeds
 import itertools
+
 
 class CacheDBConnection(db.DBConnection):
     def __init__(self, providerName):
@@ -44,6 +45,7 @@ class CacheDBConnection(db.DBConnection):
             if str(e) != 'table lastUpdate already exists':
                 raise
 
+
 class TVCache:
     def __init__(self, provider):
 
@@ -56,7 +58,7 @@ class TVCache:
         return CacheDBConnection(self.providerID)
 
     def _clearCache(self):
-        if self.shouldClearCache():
+        if self.should_clear_cache():
             myDB = self.get_db()
             myDB.action('DELETE FROM provider_cache WHERE provider = ?', [self.providerID])
 
@@ -64,7 +66,7 @@ class TVCache:
         # override this in the provider if recent search has a different data layout to backlog searches
         return self.provider._title_and_url(item)
 
-    def _cache_data(self):
+    def _cache_data(self, **kwargs):
         data = None
         return data
 
@@ -74,28 +76,23 @@ class TVCache:
     def _checkItemAuth(self, title, url):
         return True
 
-    def updateCache(self):
+    def updateCache(self, **kwargs):
         try:
             self._checkAuth()
         except AuthException as e:
             logger.log(u'Authentication error: ' + ex(e), logger.ERROR)
             return []
 
-        if self.shouldUpdate():
-            # as long as the http request worked we count this as an update
-            data = self._cache_data()
-            if not data:
-                return []
+        if self.should_update():
+            data = self._cache_data(**kwargs)
 
             # clear cache
-            self._clearCache()
-
-            # set updated
-            self.setLastUpdate()
+            if data:
+                self._clearCache()
 
             # parse data
             cl = []
-            for item in data:
+            for item in data or []:
                 title, url = self._title_and_url(item)
                 ci = self._parseItem(title, url)
                 if ci is not None:
@@ -105,10 +102,13 @@ class TVCache:
                 myDB = self.get_db()
                 myDB.mass_action(cl)
 
+            # set updated as time the attempt to fetch data is
+            self.setLastUpdate()
+
         return []
 
-    def getRSSFeed(self, url):
-        return RSSFeeds(self.provider).get_feed(url)
+    def getRSSFeed(self, url, **kwargs):
+        return RSSFeeds(self.provider).get_feed(url, **kwargs)
 
     def _translateTitle(self, title):
         return u'' + title.replace(' ', '.')
@@ -180,23 +180,15 @@ class TVCache:
     lastUpdate = property(_getLastUpdate)
     lastSearch = property(_getLastSearch)
 
-    def shouldUpdate(self):
+    def should_update(self):
         # if we've updated recently then skip the update
-        if datetime.datetime.today() - self.lastUpdate < datetime.timedelta(minutes=self.update_freq):
-            logger.log(u'Last update was too soon, using old cache: today()-' + str(self.lastUpdate) + '<' + str(
-                datetime.timedelta(minutes=self.update_freq)), logger.DEBUG)
-            return False
+        return datetime.datetime.today() - self.lastUpdate >= datetime.timedelta(minutes=self.update_freq)
 
-        return True
-
-    def shouldClearCache(self):
+    def should_clear_cache(self):
         # if recent search hasn't used our previous results yet then don't clear the cache
-        if self.lastUpdate > self.lastSearch:
-            return False
+        return self.lastSearch >= self.lastUpdate
 
-        return True
-
-    def add_cache_entry(self, name, url, parse_result=None, indexer_id=0):
+    def add_cache_entry(self, name, url, parse_result=None, indexer_id=0, id_dict=None):
 
         # check if we passed in a parsed result or should we try and create one
         if not parse_result:
@@ -204,10 +196,19 @@ class TVCache:
             # create showObj from indexer_id if available
             showObj=None
             if indexer_id:
-                showObj = helpers.findCertainShow(sickbeard.showList, indexer_id)
+                try:
+                    showObj = helpers.findCertainShow(sickbeard.showList, indexer_id)
+                except MultipleShowObjectsException:
+                    return None
+
+            if id_dict:
+                try:
+                    showObj = helpers.find_show_by_id(sickbeard.showList, id_dict=id_dict, no_mapped_ids=False)
+                except MultipleShowObjectsException:
+                    return None
 
             try:
-                np = NameParser(showObj=showObj, convert=True)
+                np = NameParser(showObj=showObj, convert=True, indexer_lookup=False)
                 parse_result = np.parse(name)
             except InvalidNameException:
                 logger.log(u'Unable to parse the filename ' + name + ' into a valid episode', logger.DEBUG)
@@ -257,7 +258,8 @@ class TVCache:
 
     def listPropers(self, date=None):
         myDB = self.get_db()
-        sql = "SELECT * FROM provider_cache WHERE name LIKE '%.PROPER.%' OR name LIKE '%.REPACK.%' AND provider = ?"
+        sql = "SELECT * FROM provider_cache WHERE name LIKE '%.PROPER.%' OR name LIKE '%.REPACK.%' " \
+              "OR name LIKE '%.REAL.%' AND provider = ?"
 
         if date:
             sql += ' AND time >= ' + str(int(time.mktime(date.timetuple())))
@@ -291,7 +293,7 @@ class TVCache:
         for curResult in sqlResults:
 
             # skip non-tv crap
-            if not show_name_helpers.pass_wordlist_checks(curResult['name'], parse=False):
+            if not show_name_helpers.pass_wordlist_checks(curResult['name'], parse=False, indexer_lookup=False):
                 continue
 
             # get the show object, or if it's not one of our shows then ignore it
@@ -340,6 +342,18 @@ class TVCache:
             result.release_group = curReleaseGroup
             result.version = curVersion
             result.content = None
+            np = NameParser(False, showObj=showObj)
+            try:
+                parsed_result = np.parse(title)
+                extra_info_no_name = parsed_result.extra_info_no_name()
+                version = parsed_result.version
+                is_anime = parsed_result.is_anime
+            except (StandardError, Exception):
+                extra_info_no_name = None
+                version = -1
+                is_anime = False
+            result.is_repack, result.properlevel = Quality.get_proper_level(extra_info_no_name, version, is_anime,
+                                                                            check_is_repack=True)
 
             # add it to the list
             if epObj not in neededEps:

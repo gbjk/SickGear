@@ -45,6 +45,8 @@ def send_nzb(nzb):
         if 1 == nzb.priority:
             params['priority'] = 1
 
+        params['nzbname'] = '%s.nzb' % nzb.name
+
         kwargs = {}
         # if it's a normal result we just pass SAB the URL
         if 'nzb' == nzb.resultType:
@@ -58,7 +60,10 @@ def send_nzb(nzb):
             nzb_type = 'file nzb'
             params['mode'] = 'addfile'
             kwargs['post_data'] = params
-            kwargs['files'] = {'nzbfile': ('%s.nzb' % nzb.name, nzb.extraInfo[0])}
+            nzb_data = nzb.get_data()
+            if not nzb_data:
+                return False
+            kwargs['files'] = {'nzbfile': ('%s.nzb' % nzb.name, nzb_data)}
 
         logger.log(u'Sending %s to SABnzbd: %s' % (nzb_type, nzb.name))
 

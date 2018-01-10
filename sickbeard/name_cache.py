@@ -18,6 +18,7 @@
 import threading
 import sickbeard
 from sickbeard import db
+from sickbeard.helpers import tryInt
 
 nameCache = {}
 nameCacheLock = threading.Lock()
@@ -74,7 +75,7 @@ def buildNameCache(show=None):
             nameCache = dict(
                 (sickbeard.helpers.full_sanitizeSceneName(x.name), [x.indexerid, -1]) for x in sickbeard.showList if x)
 
-        cacheDB = db.DBConnection('cache.db')
+        cacheDB = db.DBConnection()
 
         cache_results = cacheDB.select(
             'SELECT show_name, indexer_id, season FROM scene_exceptions WHERE indexer_id IN (%s)' % ','.join(
@@ -83,7 +84,7 @@ def buildNameCache(show=None):
         if cache_results:
             for cache_result in cache_results:
                 indexer_id = int(cache_result['indexer_id'])
-                season = int(cache_result['season'])
+                season = tryInt(cache_result['season'], -1)
                 name = sickbeard.helpers.full_sanitizeSceneName(cache_result['show_name'])
                 nameCache[name] = [indexer_id, season]
 

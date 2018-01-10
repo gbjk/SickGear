@@ -1,8 +1,8 @@
 #import sickbeard
 ##
-#set global $header = 'Post Processing'
+#set global $header = 'Process Media'
 #set global $title = $header
-#set global $topmenu = 'home'
+#set global $topmenu = 'manage'
 #set global $sbPath = '../..'
 ##
 #import os.path
@@ -96,7 +96,7 @@
 #raw
 jQuery('#episodeDir').fileBrowser({title:'Select Unprocessed Episode Folder', key:'postprocessPath'});
 $('#process_method').change(function(){
-	$('#move-and-trash').css({'display':('move' == $(this).attr('value') ? 'block' : 'none')})
+	$('#move-and-trash').css({'display':('move' == $(this).val() ? 'block' : 'none')})
 });
 #end raw
 //-->

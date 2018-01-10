@@ -19,192 +19,165 @@
 # You should have received a copy of the GNU General Public License
 # along with SickGear.  If not, see <http://www.gnu.org/licenses/>.
 
-import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
+from email.utils import formatdate
 import re
+import smtplib
 
 import sickbeard
-
-from sickbeard import logger, common
 from sickbeard import db
-from sickbeard.exceptions import ex
+from sickbeard.notifiers.generic import Notifier, notify_strings
 
 
-class EmailNotifier:
+class EmailNotifier(Notifier):
+
     def __init__(self):
+        super(EmailNotifier, self).__init__()
+
         self.last_err = None
 
-    def test_notify(self, host, port, smtp_from, use_tls, user, pwd, to):
-        msg = MIMEText('This is a test message from SickGear.  If you\'re reading this, the test succeeded.')
-        msg['Subject'] = 'SickGear: Test Message'
-        msg['From'] = smtp_from
-        msg['To'] = to
-        return self._sendmail(host, port, smtp_from, use_tls, user, pwd, [to], msg, True)
+    def _sendmail(self, host, port, smtp_from, use_tls, user, pwd, to, msg, smtp_debug=False):
 
-    def notify_snatch(self, ep_name, title='Snatched:'):
-        """
-        Send a notification that an episode was snatched
-
-        ep_name: The name of the episode that was snatched
-        title: The title of the notification (optional)
-        """
-        ep_name = ep_name.encode('utf-8', 'replace')
-
-        if sickbeard.EMAIL_NOTIFY_ONSNATCH:
-            show = self._parseEp(ep_name)
-            to = self._generate_recepients(show)
-            if len(to) == 0:
-                logger.log('Skipping email notification because there are no configured recepients', logger.WARNING)
-            else:
-                try:
-                    msg = MIMEMultipart('alternative')
-                    msg.attach(MIMEText(
-                        "<body style='font-family:Helvetica, Arial, sans-serif;'><h3>SickGear Notification - Snatched</h3>\n<p>Show: <b>" + re.search(
-                            '(.+?) -.+', ep_name).group(1) + '</b></p>\n<p>Episode: <b>' + re.search(
-                            '.+ - (.+?-.+) -.+', ep_name).group(
-                            1) + "</b></p>\n\n<footer style='margin-top: 2.5em; padding: .7em 0; color: #777; border-top: #BBB solid 1px;'>Powered by SickGear.</footer></body>",
-                        'html'))
-                except:
-                    msg = MIMEText(ep_name)
-
-                msg['Subject'] = 'Snatched: ' + ep_name
-                msg['From'] = sickbeard.EMAIL_FROM
-                msg['To'] = ','.join(to)
-                if self._sendmail(sickbeard.EMAIL_HOST, sickbeard.EMAIL_PORT, sickbeard.EMAIL_FROM, sickbeard.EMAIL_TLS,
-                                  sickbeard.EMAIL_USER, sickbeard.EMAIL_PASSWORD, to, msg):
-                    logger.log('Snatch notification sent to [%s] for "%s"' % (to, ep_name), logger.DEBUG)
-                else:
-                    logger.log('Snatch notification ERROR: %s' % self.last_err, logger.ERROR)
-
-    def notify_download(self, ep_name, title='Completed:'):
-        """
-        Send a notification that an episode was downloaded
-
-        ep_name: The name of the episode that was downloaded
-        title: The title of the notification (optional)
-        """
-        ep_name = ep_name.encode('utf-8', 'replace')
-
-        if sickbeard.EMAIL_NOTIFY_ONDOWNLOAD:
-            show = self._parseEp(ep_name)
-            to = self._generate_recepients(show)
-            if len(to) == 0:
-                logger.log('Skipping email notification because there are no configured recepients', logger.WARNING)
-            else:
-                try:
-                    msg = MIMEMultipart('alternative')
-                    msg.attach(MIMEText(
-                        "<body style='font-family:Helvetica, Arial, sans-serif;'><h3>SickGear Notification - Downloaded</h3>\n<p>Show: <b>" + re.search(
-                            '(.+?) -.+', ep_name).group(1) + '</b></p>\n<p>Episode: <b>' + re.search(
-                            '.+ - (.+?-.+) -.+', ep_name).group(
-                            1) + "</b></p>\n\n<footer style='margin-top: 2.5em; padding: .7em 0; color: #777; border-top: #BBB solid 1px;'>Powered by SickGear.</footer></body>",
-                        'html'))
-                except:
-                    msg = MIMEText(ep_name)
-
-                msg['Subject'] = 'Downloaded: ' + ep_name
-                msg['From'] = sickbeard.EMAIL_FROM
-                msg['To'] = ','.join(to)
-                if self._sendmail(sickbeard.EMAIL_HOST, sickbeard.EMAIL_PORT, sickbeard.EMAIL_FROM, sickbeard.EMAIL_TLS,
-                                  sickbeard.EMAIL_USER, sickbeard.EMAIL_PASSWORD, to, msg):
-                    logger.log('Download notification sent to [%s] for "%s"' % (to, ep_name), logger.DEBUG)
-                else:
-                    logger.log('Download notification ERROR: %s' % self.last_err, logger.ERROR)
-
-    def notify_subtitle_download(self, ep_name, lang, title='Downloaded subtitle:'):
-        """
-        Send a notification that an subtitle was downloaded
-
-        ep_name: The name of the episode that was downloaded
-        lang: Subtitle language wanted
-        """
-        ep_name = ep_name.encode('utf-8', 'replace')
-
-        if sickbeard.EMAIL_NOTIFY_ONSUBTITLEDOWNLOAD:
-            show = self._parseEp(ep_name)
-            to = self._generate_recepients(show)
-            if len(to) == 0:
-                logger.log('Skipping email notification because there are no configured recepients', logger.WARNING)
-            else:
-                try:
-                    msg = MIMEMultipart('alternative')
-                    msg.attach(MIMEText(
-                        "<body style='font-family:Helvetica, Arial, sans-serif;'><h3>SickGear Notification - Subtitle Downloaded</h3>\n<p>Show: <b>" + re.search(
-                            '(.+?) -.+', ep_name).group(1) + '</b></p>\n<p>Episode: <b>' + re.search(
-                            '.+ - (.+?-.+) -.+', ep_name).group(
-                            1) + '</b></p>\n<p>Language: <b>' + lang + "</b></p>\n\n<footer style='margin-top: 2.5em; padding: .7em 0; color: #777; border-top: #BBB solid 1px;'>Powered by SickGear.</footer></body>",
-                        'html'))
-                except:
-                    msg = MIMEText(ep_name + ': ' + lang)
-
-                msg['Subject'] = lang + ' Subtitle Downloaded: ' + ep_name
-                msg['From'] = sickbeard.EMAIL_FROM
-                msg['To'] = ','.join(to)
-                if self._sendmail(sickbeard.EMAIL_HOST, sickbeard.EMAIL_PORT, sickbeard.EMAIL_FROM, sickbeard.EMAIL_TLS,
-                                  sickbeard.EMAIL_USER, sickbeard.EMAIL_PASSWORD, to, msg):
-                    logger.log('Download notification sent to [%s] for "%s"' % (to, ep_name), logger.DEBUG)
-                else:
-                    logger.log('Download notification ERROR: %s' % self.last_err, logger.ERROR)
-
-
-    def notify_git_update(self, new_version='??'):
-        pass
-
-    def _generate_recepients(self, show):
-        addrs = []
-
-        # Grab the global recipients
-        for addr in sickbeard.EMAIL_LIST.split(','):
-            if (len(addr.strip()) > 0):
-                addrs.append(addr)
-
-        # Grab the recipients for the show
-        myDB = db.DBConnection()
-        for s in show:
-            for subs in myDB.select('SELECT notify_list FROM tv_shows WHERE show_name = ?', (s,)):
-                if subs['notify_list']:
-                    for addr in subs['notify_list'].split(','):
-                        if (len(addr.strip()) > 0):
-                            addrs.append(addr)
-
-        addrs = set(addrs)
-        logger.log('Notification recepients: %s' % addrs, logger.DEBUG)
-        return addrs
-
-    def _sendmail(self, host, port, smtp_from, use_tls, user, pwd, to, msg, smtpDebug=False):
-        logger.log('HOST: %s; PORT: %s; FROM: %s, TLS: %s, USER: %s, PWD: %s, TO: %s' % (
-            host, port, smtp_from, use_tls, user, pwd, to), logger.DEBUG)
+        use_tls = 1 == sickbeard.helpers.tryInt(use_tls)
+        login = any(user) and any(pwd)
+        self._log_debug(u'Sendmail HOST: %s; PORT: %s; LOGIN: %s, TLS: %s, USER: %s, FROM: %s, TO: %s' % (
+            host, port, login, use_tls, user, smtp_from, to))
 
         try:
             srv = smtplib.SMTP(host, int(port))
-            if smtpDebug:
+            if smtp_debug:
                 srv.set_debuglevel(1)
-            if (use_tls == '1' or use_tls == True) or (len(user) > 0 and len(pwd) > 0):
+
+            if use_tls or login:
                 srv.ehlo()
-                logger.log('Sent initial EHLO command!', logger.DEBUG)
-            if use_tls == '1' or use_tls == True:
-                srv.starttls()
-                logger.log('Sent STARTTLS command!', logger.DEBUG)
-            if len(user) > 0 and len(pwd) > 0:
-                srv.login(user, pwd)
-                logger.log('Sent LOGIN command!', logger.DEBUG)
+                self._log_debug(u'Sent initial EHLO command')
+
+                if use_tls:
+                    srv.starttls()
+                    srv.ehlo()
+                    self._log_debug(u'Sent STARTTLS and EHLO command')
+
+                if login:
+                    srv.login(user, pwd)
+                    self._log_debug(u'Sent LOGIN command')
+
             srv.sendmail(smtp_from, to, msg.as_string())
             srv.quit()
-            return True
+
         except Exception as e:
             self.last_err = '%s' % e
             return False
 
-    def _parseEp(self, ep_name):
-        ep_name = ep_name.encode('utf-8', 'replace')
+        return True
 
-        sep = ' - '
-        titles = ep_name.split(sep)
-        titles.sort(key=len, reverse=True)
-        logger.log('TITLES: %s' % titles, logger.DEBUG)
-        return titles
+    @staticmethod
+    def _get_recipients(show_name=None):
+
+        email_list = []
+
+        # Grab the global recipients
+        if sickbeard.EMAIL_LIST:
+            for email_address in sickbeard.EMAIL_LIST.split(','):
+                if any(email_address.strip()):
+                    email_list.append(email_address)
+
+        # Grab the recipients for the show
+        if None is not show_name:
+            my_db = db.DBConnection()
+            for result in my_db.select('SELECT notify_list FROM tv_shows WHERE show_name = ?', (show_name,)):
+                if result['notify_list']:
+                    for email_address in result['notify_list'].split(','):
+                        if any(email_address.strip()):
+                            email_list.append(email_address)
+
+        return list(set(email_list))
+
+    def _notify(self, title, body, lang='', extra='', **kwargs):
+
+        show = body.split(' - ')[0]
+        to = self._get_recipients(show)
+        if not any(to):
+            self._log_warning(u'No email recipients to notify, skipping')
+            return
+
+        self._log_debug(u'Email recipients to notify: %s' % to)
+
+        try:
+            msg = MIMEMultipart('alternative')
+            msg.attach(MIMEText(
+                '<body style="font-family:Helvetica, Arial, sans-serif;">' +
+                '<h3>SickGear Notification - %s</h3>\n' % title +
+                '<p>Show: <b>' + show.encode('ascii', 'xmlcharrefreplace') +
+                '</b></p>\n<p>Episode: <b>' +
+                unicode(re.search('.+ - (.+?-.+) -.+', body).group(1)).encode('ascii', 'xmlcharrefreplace') +
+                extra +
+                '</b></p>\n\n' +
+                '<footer style="margin-top:2.5em;padding:.7em 0;color:#777;border-top:#BBB solid 1px;">' +
+                'Powered by SickGear.</footer></body>',
+                'html'))
+        except (StandardError, Exception):
+            try:
+                msg = MIMEText(body)
+            except (StandardError, Exception):
+                msg = MIMEText('Episode %s' % title)
+
+        msg['Subject'] = '%s%s: %s' % (lang, title, body)
+        msg['From'] = sickbeard.EMAIL_FROM
+        msg['To'] = ','.join(to)
+        msg['Date'] = formatdate(localtime=True)
+        if self._sendmail(sickbeard.EMAIL_HOST, sickbeard.EMAIL_PORT, sickbeard.EMAIL_FROM, sickbeard.EMAIL_TLS,
+                          sickbeard.EMAIL_USER, sickbeard.EMAIL_PASSWORD, to, msg):
+            self._log_debug(u'%s notification sent to [%s] for "%s"' % (title, to, body))
+        else:
+            self._log_error(u'%s notification ERROR: %s' % (title, self.last_err))
+
+    def test_notify(self, host, port, smtp_from, use_tls, user, pwd, to):
+        self._testing = True
+
+        msg = MIMEText('Success.  This is a SickGear test message. Typically sent on, %s' % notify_strings['download'])
+        msg['Subject'] = 'SickGear: Test message'
+        msg['From'] = smtp_from
+        msg['To'] = to
+        msg['Date'] = formatdate(localtime=True)
+
+        r = self._sendmail(host, port, smtp_from, use_tls, user, pwd, [to], msg, True)
+        return self._choose(('Success, notification sent.',
+                             'Failed to send notification: %s' % self.last_err)[not r], r)
+
+    def notify_snatch(self, ep_name, title=None):
+        """
+        Send a notification that an episode was snatched
+
+        :param ep_name: The name of the episode that was snatched
+        :param title: The title of the notification (optional)
+        """
+
+        title = sickbeard.EMAIL_OLD_SUBJECTS and 'Snatched' or title or notify_strings['snatch']
+        self._notify(title, ep_name)
+
+    def notify_download(self, ep_name, title=None):
+        """
+        Send a notification that an episode was downloaded
+
+        :param ep_name: The name of the episode that was downloaded
+        :param title: The title of the notification (optional)
+        """
+
+        title = sickbeard.EMAIL_OLD_SUBJECTS and 'Downloaded' or title or notify_strings['download']
+        self._notify(title, ep_name)
+
+    def notify_subtitle_download(self, ep_name, lang, title=None):
+        """
+        Send a notification that a subtitle was downloaded
+
+        :param ep_name: The name of the episode that was downloaded
+        :param lang: Subtitle language
+        :param title: The title of the notification (optional)
+        """
+
+        title = sickbeard.EMAIL_OLD_SUBJECTS and 'Subtitle Downloaded' or title or notify_strings['subtitle_download']
+        self._notify(title, ep_name, '%s ' % lang, '</b></p>\n<p>Language: <b>%s' % lang)
 
 
 notifier = EmailNotifier
